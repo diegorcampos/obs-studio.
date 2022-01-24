@@ -33,6 +33,7 @@ set(obs-ffmpeg_SOURCES
 	obs-ffmpeg.c
 	obs-ffmpeg-audio-encoders.c
 	obs-ffmpeg-nvenc.c
+	obs-ffmpeg-amf.c
 	obs-ffmpeg-av1.c
 	obs-ffmpeg-output.c
 	obs-ffmpeg-mux.c
@@ -56,6 +57,7 @@ if(WIN32)
 	set(MODULE_DESCRIPTION "OBS FFmpeg module")
 	configure_file(${CMAKE_SOURCE_DIR}/cmake/winrc/obs-module.rc.in obs-ffmpeg.rc)
 	list(APPEND obs-ffmpeg_SOURCES
+		obs-amf.cpp
 		jim-nvenc.c
 		jim-nvenc-helpers.c
 		obs-ffmpeg.rc)
@@ -78,3 +80,6 @@ set_target_properties(obs-ffmpeg PROPERTIES FOLDER "plugins/obs-ffmpeg")
 install_obs_plugin_with_data(obs-ffmpeg data)
 
 add_subdirectory(ffmpeg-mux)
+if(WIN32)
+	add_subdirectory(obs-amf-test)
+endif()

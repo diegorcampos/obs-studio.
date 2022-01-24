@@ -15,88 +15,97 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
 ******************************************************************************/
 
-#include <util/platform.h>
 #include <util/darray.h>
 #include <util/dstr.h>
 #include <util/base.h>
 #include <media-io/video-io.h>
-#include <opts-parser.h>
 #include <obs-module.h>
+#include <obs-avc.h>
 
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
+#include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 
 #include "obs-ffmpeg-formats.h"
 
-#define do_log(level, format, ...)                 \
-	blog(level, "[AV1 encoder: '%s'] " format, \
+#define do_log(level, format, ...)                        \
+	blog(level, "[FFMpeg AMF encoder: '%s'] " format, \
 	     obs_encoder_get_name(enc->encoder), ##__VA_ARGS__)
 
-#define error(format, ...) do_log(LOG_ERROR, format, ##__VA_ARGS__)
 #define warn(format, ...) do_log(LOG_WARNING, format, ##__VA_ARGS__)
 #define info(format, ...) do_log(LOG_INFO, format, ##__VA_ARGS__)
 #define debug(format, ...) do_log(LOG_DEBUG, format, ##__VA_ARGS__)
 
-struct av1_encoder {
+struct ffmpeg_amf_encoder {
 	obs_encoder_t *encoder;
-	const char *enc_name;
-	bool svtav1;
 
-	AVCodec *avcodec;
+	AVCodec *ffmpeg_amf;
 	AVCodecContext *context;
-	int64_t start_ts;
-	bool first_packet;
 
 	AVFrame *vframe;
 
 	DARRAY(uint8_t) buffer;
-	DARRAY(uint8_t) header;
+
+	uint8_t *header;
+	size_t header_size;
+
+	uint8_t *sei;
+	size_t sei_size;
 
 	int height;
+	bool first_packet;
 	bool initialized;
 };
 
-static const char *aom_av1_getname(void *unused)
+static const char *ffmpeg_amf_getname(void *unused)
 {
 	UNUSED_PARAMETER(unused);
-	return "AOM AV1";
+	return "FFmpeg AMF fallback for H.264";
 }
 
-static const char *svt_av1_getname(void *unused)
+static inline bool valid_format(enum video_format format)
 {
-	UNUSED_PARAMETER(unused);
-	return "SVT-AV1";
+	return format == VIDEO_FORMAT_I420 || format == VIDEO_FORMAT_NV12 ||
+	       format == VIDEO_FORMAT_I444;
 }
 
-static void av1_video_info(void *data, struct video_scale_info *info)
+static void ffmpeg_amf_video_info(void *data, struct video_scale_info *info)
 {
-	UNUSED_PARAMETER(data);
-	info->format = VIDEO_FORMAT_I420;
+	struct ffmpeg_amf_encoder *enc = data;
+	enum video_format pref_format;
+
+	pref_format = obs_encoder_get_preferred_video_format(enc->encoder);
+
+	if (!valid_format(pref_format)) {
+		pref_format = valid_format(info->format) ? info->format
+							 : VIDEO_FORMAT_NV12;
+	}
+
+	info->format = pref_format;
 }
 
-static bool av1_init_codec(struct av1_encoder *enc)
+static bool ffmpeg_amf_init_codec(struct ffmpeg_amf_encoder *enc)
 {
 	int ret;
 
-	enc->context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-
-	ret = avcodec_open2(enc->context, enc->avcodec, NULL);
+	ret = avcodec_open2(enc->context, enc->ffmpeg_amf, NULL);
 	if (ret < 0) {
 		if (!obs_encoder_get_last_error(enc->encoder)) {
 			struct dstr error_message = {0};
 
 			dstr_copy(&error_message,
-				  obs_module_text("Encoder.Error"));
-			dstr_replace(&error_message, "%1", enc->enc_name);
-			dstr_replace(&error_message, "%2", av_err2str(ret));
+				  obs_module_text("NVENC.Error"));
+			dstr_replace(&error_message, "%1", av_err2str(ret));
 			dstr_cat(&error_message, "\r\n\r\n");
+			dstr_cat(&error_message,
+				 obs_module_text("NVENC.CheckDrivers"));
 
 			obs_encoder_set_last_error(enc->encoder,
 						   error_message.array);
 			dstr_free(&error_message);
 		}
-		warn("Failed to open %s: %s", enc->enc_name, av_err2str(ret));
+		warn("Failed to open NVENC codec: %s", av_err2str(ret));
 		return false;
 	}
 
@@ -124,13 +133,15 @@ static bool av1_init_codec(struct av1_encoder *enc)
 
 enum RC_MODE { RC_MODE_CBR, RC_MODE_VBR, RC_MODE_CQP, RC_MODE_LOSSLESS };
 
-static bool av1_update(struct av1_encoder *enc, obs_data_t *settings)
+static bool ffmpeg_amf_update(struct ffmpeg_amf_encoder *enc,
+			      obs_data_t *settings)
 {
 	const char *rc = obs_data_get_string(settings, "rate_control");
 	int bitrate = (int)obs_data_get_int(settings, "bitrate");
 	int cqp = (int)obs_data_get_int(settings, "cqp");
 	int keyint_sec = (int)obs_data_get_int(settings, "keyint_sec");
-	int preset = (int)obs_data_get_int(settings, "preset");
+	const char *preset = obs_data_get_string(settings, "preset");
+	const char *profile = obs_data_get_string(settings, "profile");
 
 	video_t *video = obs_encoder_video(enc->encoder);
 	const struct video_output_info *voi = video_output_get_info(video);
@@ -140,33 +151,34 @@ static bool av1_update(struct av1_encoder *enc, obs_data_t *settings)
 	info.colorspace = voi->colorspace;
 	info.range = voi->range;
 
-	enc->context->thread_count = 0;
+	bool twopass = false;
 
-	av1_video_info(enc, &info);
-	av_opt_set_int(enc->context->priv_data,
-		       enc->svtav1 ? "preset" : "cpu-used", preset, 0);
-	if (!enc->svtav1) {
-		av_opt_set(enc->context->priv_data, "usage", "realtime", 0);
-#if 0
-		av_opt_set_int(enc->context->priv_data, "tile-columns", 4, 0);
-		//av_opt_set_int(enc->context->priv_data, "tile-rows", 4, 0);
-#else
-		av_opt_set_int(enc->context->priv_data, "tile-columns", 2, 0);
-		av_opt_set_int(enc->context->priv_data, "tile-rows", 2, 0);
-#endif
-		av_opt_set_int(enc->context->priv_data, "row-mt", 1, 0);
-	}
+	ffmpeg_amf_video_info(enc, &info);
+	av_opt_set(enc->context->priv_data, "profile", profile, 0);
+	av_opt_set(enc->context->priv_data, "preset", preset, 0);
 
 	if (astrcmpi(rc, "cqp") == 0) {
+		av_opt_set(enc->context->priv_data, "rc", "cqp", 0);
 		bitrate = 0;
 		enc->context->global_quality = cqp;
 
-	} else if (astrcmpi(rc, "vbr") != 0) { /* CBR by default */
-		const int64_t rate = bitrate * INT64_C(1000);
+	} else {
+		const int64_t rate = bitrate * 1000LL;
+
+		if (astrcmpi(rc, "vbr") == 0) {
+			av_opt_set(enc->context->priv_data, "rc", "vbr_peak",
+				   0);
+		} else { /* CBR by default */
+			av_opt_set(enc->context->priv_data, "rc", "cbr", 0);
+			enc->context->rc_min_rate = rate;
+		}
+
 		enc->context->rc_max_rate = rate;
-		enc->context->rc_min_rate = rate;
 		cqp = 0;
 	}
+
+	av_opt_set(enc->context->priv_data, "level", "auto", 0);
+	av_opt_set_int(enc->context->priv_data, "2pass", twopass, 0);
 
 	const int rate = bitrate * 1000;
 	enc->context->bit_rate = rate;
@@ -201,110 +213,115 @@ static bool av1_update(struct av1_encoder *enc, obs_data_t *settings)
 	if (keyint_sec)
 		enc->context->gop_size =
 			keyint_sec * voi->fps_num / voi->fps_den;
+	else
+		enc->context->gop_size = 250;
 
 	enc->height = enc->context->height;
 
-	const char *ffmpeg_opts = obs_data_get_string(settings, "ffmpeg_opts");
-	struct obs_options opts = obs_parse_options(ffmpeg_opts);
-
-	for (size_t i = 0; i < opts.count; i++) {
-		struct obs_option *opt = &opts.options[i];
-		av_opt_set(enc->context->priv_data, opt->name, opt->value, 0);
-	}
-
-	obs_free_options(opts);
-
 	info("settings:\n"
-	     "\tencoder:      %s\n"
 	     "\trate_control: %s\n"
 	     "\tbitrate:      %d\n"
 	     "\tcqp:          %d\n"
 	     "\tkeyint:       %d\n"
-	     "\tpreset:       %d\n"
+	     "\tpreset:       %s\n"
+	     "\tprofile:      %s\n"
 	     "\twidth:        %d\n"
-	     "\theight:       %d\n"
-	     "\tffmpeg opts:  %s\n",
-	     enc->enc_name, rc, bitrate, cqp, enc->context->gop_size, preset,
-	     enc->context->width, enc->context->height, ffmpeg_opts);
+	     "\theight:       %d\n",
+	     rc, bitrate, cqp, enc->context->gop_size, preset, profile,
+	     enc->context->width, enc->context->height);
 
-	return av1_init_codec(enc);
+	return ffmpeg_amf_init_codec(enc);
 }
 
-static void av1_destroy(void *data)
+static bool ffmpeg_amf_reconfigure(void *data, obs_data_t *settings)
 {
-	struct av1_encoder *enc = data;
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(58, 19, 101)
+	struct ffmpeg_amf_encoder *enc = data;
+
+	const int64_t bitrate = obs_data_get_int(settings, "bitrate");
+	const char *rc = obs_data_get_string(settings, "rate_control");
+	bool cbr = astrcmpi(rc, "CBR") == 0;
+	bool vbr = astrcmpi(rc, "VBR") == 0;
+	if (cbr || vbr) {
+		const int64_t rate = bitrate * 1000;
+		enc->context->bit_rate = rate;
+		enc->context->rc_max_rate = rate;
+	}
+#endif
+	return true;
+}
+
+static void ffmpeg_amf_destroy(void *data)
+{
+	struct ffmpeg_amf_encoder *enc = data;
 
 	if (enc->initialized) {
 		AVPacket pkt = {0};
 		int r_pkt = 1;
 
-		/* flush remaining data */
-		avcodec_send_frame(enc->context, NULL);
-
 		while (r_pkt) {
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(57, 40, 101)
 			if (avcodec_receive_packet(enc->context, &pkt) < 0)
 				break;
+#else
+			if (avcodec_encode_video2(enc->context, &pkt, NULL,
+						  &r_pkt) < 0)
+				break;
+#endif
 
 			if (r_pkt)
 				av_packet_unref(&pkt);
 		}
 	}
 
-	avcodec_free_context(&enc->context);
+	avcodec_close(enc->context);
 	av_frame_unref(enc->vframe);
 	av_frame_free(&enc->vframe);
 	da_free(enc->buffer);
-	da_free(enc->header);
+	bfree(enc->header);
+	bfree(enc->sei);
 
 	bfree(enc);
 }
 
-static void *av1_create_internal(obs_data_t *settings, obs_encoder_t *encoder,
-				 const char *enc_lib, const char *enc_name)
+static void *ffmpeg_amf_create(obs_data_t *settings, obs_encoder_t *encoder)
 {
-	struct av1_encoder *enc;
+	struct ffmpeg_amf_encoder *enc;
+
+#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(58, 9, 100)
+	avcodec_register_all();
+#endif
 
 	enc = bzalloc(sizeof(*enc));
 	enc->encoder = encoder;
-	enc->avcodec = avcodec_find_encoder_by_name(enc_lib);
-	enc->enc_name = enc_name;
-	if (strcmp(enc_lib, "libsvtav1") == 0)
-		enc->svtav1 = true;
+	enc->ffmpeg_amf = avcodec_find_encoder_by_name("h264_amf");
+	if (!enc->ffmpeg_amf)
+		enc->ffmpeg_amf = avcodec_find_encoder_by_name("amf_h264");
 	enc->first_packet = true;
 
 	blog(LOG_INFO, "---------------------------------");
 
-	if (!enc->avcodec) {
+	if (!enc->ffmpeg_amf) {
 		obs_encoder_set_last_error(encoder,
-					   "Couldn't find AV1 encoder");
-		warn("Couldn't find AV1 encoder");
+					   "Couldn't find AMF encoder");
+		warn("Couldn't find encoder");
 		goto fail;
 	}
 
-	enc->context = avcodec_alloc_context3(enc->avcodec);
+	enc->context = avcodec_alloc_context3(enc->ffmpeg_amf);
 	if (!enc->context) {
 		warn("Failed to create codec context");
 		goto fail;
 	}
 
-	if (!av1_update(enc, settings))
+	if (!ffmpeg_amf_update(enc, settings))
 		goto fail;
 
 	return enc;
 
 fail:
-	av1_destroy(enc);
+	ffmpeg_amf_destroy(enc);
 	return NULL;
-}
-
-static void *svt_av1_create(obs_data_t *settings, obs_encoder_t *encoder)
-{
-	return av1_create_internal(settings, encoder, "libsvtav1", "SVT-AV1");
-}
-
-static void *aom_av1_create(obs_data_t *settings, obs_encoder_t *encoder)
-{
-	return av1_create_internal(settings, encoder, "libaom-av1", "AOM AV1");
 }
 
 static inline void copy_data(AVFrame *pic, const struct encoder_frame *frame,
@@ -333,26 +350,21 @@ static inline void copy_data(AVFrame *pic, const struct encoder_frame *frame,
 	}
 }
 
-#define SEC_TO_NSEC 1000000000LL
-#define TIMEOUT_MAX_SEC 5
-#define TIMEOUT_MAX_NSEC (TIMEOUT_MAX_SEC * SEC_TO_NSEC)
-
-static bool av1_encode(void *data, struct encoder_frame *frame,
-		       struct encoder_packet *packet, bool *received_packet)
+static bool ffmpeg_amf_encode(void *data, struct encoder_frame *frame,
+			      struct encoder_packet *packet,
+			      bool *received_packet)
 {
-	struct av1_encoder *enc = data;
+	struct ffmpeg_amf_encoder *enc = data;
 	AVPacket av_pkt = {0};
-	bool timeout = false;
-	int64_t cur_ts = (int64_t)os_gettime_ns();
 	int got_packet;
 	int ret;
 
-	if (!enc->start_ts)
-		enc->start_ts = cur_ts;
+	av_init_packet(&av_pkt);
 
 	copy_data(enc->vframe, frame, enc->height, enc->context->pix_fmt);
 
 	enc->vframe->pts = frame->pts;
+#if LIBAVFORMAT_VERSION_INT >= AV_VERSION_INT(57, 40, 101)
 	ret = avcodec_send_frame(enc->context, enc->vframe);
 	if (ret == 0)
 		ret = avcodec_receive_packet(enc->context, &av_pkt);
@@ -361,87 +373,54 @@ static bool av1_encode(void *data, struct encoder_frame *frame,
 
 	if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN))
 		ret = 0;
+#else
+	ret = avcodec_encode_video2(enc->context, &av_pkt, enc->vframe,
+				    &got_packet);
+#endif
 	if (ret < 0) {
-		warn("av1_encode: Error encoding: %s", av_err2str(ret));
+		warn("ffmpeg_amf_encode: Error encoding: %s", av_err2str(ret));
 		return false;
 	}
 
 	if (got_packet && av_pkt.size) {
 		if (enc->first_packet) {
-			if (enc->svtav1) {
-				da_copy_array(enc->header,
-					      enc->context->extradata,
-					      enc->context->extradata_size);
-			} else {
-				for (int i = 0; i < av_pkt.side_data_elems;
-				     i++) {
-					AVPacketSideData *side_data =
-						av_pkt.side_data + i;
-					if (side_data->type ==
-					    AV_PKT_DATA_NEW_EXTRADATA) {
-						da_copy_array(enc->header,
-							      side_data->data,
-							      side_data->size);
-						break;
-					}
-				}
-			}
+			uint8_t *new_packet;
+			size_t size;
+
 			enc->first_packet = false;
+			obs_extract_avc_headers(av_pkt.data, av_pkt.size,
+						&new_packet, &size,
+						&enc->header, &enc->header_size,
+						&enc->sei, &enc->sei_size);
+
+			da_copy_array(enc->buffer, new_packet, size);
+			bfree(new_packet);
+		} else {
+			da_copy_array(enc->buffer, av_pkt.data, av_pkt.size);
 		}
-		da_copy_array(enc->buffer, av_pkt.data, av_pkt.size);
 
 		packet->pts = av_pkt.pts;
 		packet->dts = av_pkt.dts;
 		packet->data = enc->buffer.array;
 		packet->size = enc->buffer.num;
 		packet->type = OBS_ENCODER_VIDEO;
-		packet->keyframe = !!(av_pkt.flags & AV_PKT_FLAG_KEY);
+		packet->keyframe = obs_avc_keyframe(packet->data, packet->size);
 		*received_packet = true;
-
-		uint64_t recv_ts_nsec =
-			util_mul_div64((uint64_t)av_pkt.dts,
-				       (uint64_t)SEC_TO_NSEC,
-				       (uint64_t)enc->context->time_base.den) +
-			enc->start_ts;
-
-#if 0
-		debug("cur: %lld, packet: %lld, diff: %lld", cur_ts,
-		      recv_ts_nsec, cur_ts - recv_ts_nsec);
-#endif
-		if (llabs(cur_ts - recv_ts_nsec) > TIMEOUT_MAX_NSEC) {
-			char timeout_str[16];
-			snprintf(timeout_str, sizeof(timeout_str), "%d",
-				 TIMEOUT_MAX_SEC);
-
-			struct dstr error_text = {0};
-			dstr_copy(&error_text,
-				  obs_module_text("Encoder.Timeout"));
-			dstr_replace(&error_text, "%1", enc->enc_name);
-			dstr_replace(&error_text, "%2", timeout_str);
-			obs_encoder_set_last_error(enc->encoder,
-						   error_text.array);
-			dstr_free(&error_text);
-
-			error("Encoding queue duration surpassed %d "
-			      "seconds, terminating encoder",
-			      TIMEOUT_MAX_SEC);
-			timeout = true;
-		}
 	} else {
 		*received_packet = false;
 	}
 
 	av_packet_unref(&av_pkt);
-	return !timeout;
+	return true;
 }
 
-void av1_defaults(obs_data_t *settings)
+void amf_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "bitrate", 2500);
-	obs_data_set_default_int(settings, "keyint_sec", 0);
-	obs_data_set_default_int(settings, "cqp", 50);
+	obs_data_set_default_int(settings, "cqp", 20);
 	obs_data_set_default_string(settings, "rate_control", "CBR");
-	obs_data_set_default_int(settings, "preset", 8);
+	obs_data_set_default_string(settings, "preset", "hq");
+	obs_data_set_default_string(settings, "profile", "high");
 }
 
 static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p,
@@ -449,19 +428,15 @@ static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p,
 {
 	const char *rc = obs_data_get_string(settings, "rate_control");
 	bool cqp = astrcmpi(rc, "CQP") == 0;
-	bool vbr = astrcmpi(rc, "VBR") == 0;
 
 	p = obs_properties_get(ppts, "bitrate");
 	obs_property_set_visible(p, !cqp);
-	p = obs_properties_get(ppts, "max_bitrate");
-	obs_property_set_visible(p, vbr);
 	p = obs_properties_get(ppts, "cqp");
 	obs_property_set_visible(p, cqp);
-
 	return true;
 }
 
-obs_properties_t *av1_properties(bool svtav1)
+obs_properties_t *amf_properties(void *unused)
 {
 	obs_properties_t *props = obs_properties_create();
 	obs_property_t *p;
@@ -481,84 +456,75 @@ obs_properties_t *av1_properties(bool svtav1)
 	obs_property_int_set_suffix(p, " Kbps");
 
 	obs_properties_add_int(props, "cqp", obs_module_text("NVENC.CQLevel"),
-			       1, 63, 1);
+			       1, 30, 1);
 
 	obs_properties_add_int(props, "keyint_sec",
 			       obs_module_text("KeyframeIntervalSec"), 0, 10,
 			       1);
 
 	p = obs_properties_add_list(props, "preset", obs_module_text("Preset"),
-				    OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_INT);
+				    OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
 
-	if (svtav1) {
-		obs_property_list_add_int(p, "Very likely too slow (6)", 6);
-		obs_property_list_add_int(p, "Probably too slow (7)", 7);
-		obs_property_list_add_int(p, "Seems okay (8)", 8);
-		obs_property_list_add_int(p, "Might be better (9)", 9);
-		obs_property_list_add_int(p, "A little bit faster? (10)", 10);
-		obs_property_list_add_int(p, "Hmm, not bad speed (11)", 11);
-		obs_property_list_add_int(
-			p, "Whoa, although quality might be not so great (12)",
-			12);
-	} else {
-		obs_property_list_add_int(p, "Probably too slow (7)", 7);
-		obs_property_list_add_int(p, "Okay (8)", 8);
-		obs_property_list_add_int(p, "Fast (9)", 9);
-		obs_property_list_add_int(p, "Fastest (10)", 10);
-	}
+#define add_preset(val)                                                       \
+	obs_property_list_add_string(p, obs_module_text("NVENC.Preset." val), \
+				     val)
+	add_preset("quality");
+	add_preset("balanced");
+	add_preset("speed");
+#undef add_preset
 
-	obs_properties_add_text(props, "ffmpeg_opts",
-				obs_module_text("FFmpegOpts"),
-				OBS_TEXT_DEFAULT);
+	p = obs_properties_add_list(props, "profile",
+				    obs_module_text("Profile"),
+				    OBS_COMBO_TYPE_LIST,
+				    OBS_COMBO_FORMAT_STRING);
 
+#define add_profile(val) obs_property_list_add_string(p, val, val)
+	add_profile("high");
+	add_profile("main");
+	add_profile("baseline");
+#undef add_profile
+
+	UNUSED_PARAMETER(unused);
 	return props;
 }
 
-obs_properties_t *aom_av1_properties(void *unused)
+static bool ffmpeg_amf_extra_data(void *data, uint8_t **extra_data,
+				  size_t *size)
 {
-	UNUSED_PARAMETER(unused);
-	return av1_properties(false);
-}
+	struct ffmpeg_amf_encoder *enc = data;
 
-obs_properties_t *svt_av1_properties(void *unused)
-{
-	UNUSED_PARAMETER(unused);
-	return av1_properties(true);
-}
-
-static bool av1_extra_data(void *data, uint8_t **extra_data, size_t *size)
-{
-	struct av1_encoder *enc = data;
-
-	*extra_data = enc->header.array;
-	*size = enc->header.num;
+	*extra_data = enc->header;
+	*size = enc->header_size;
 	return true;
 }
 
-struct obs_encoder_info svt_av1_encoder_info = {
-	.id = "ffmpeg_svt_av1",
-	.type = OBS_ENCODER_VIDEO,
-	.codec = "av1",
-	.get_name = svt_av1_getname,
-	.create = svt_av1_create,
-	.destroy = av1_destroy,
-	.encode = av1_encode,
-	.get_defaults = av1_defaults,
-	.get_properties = svt_av1_properties,
-	.get_extra_data = av1_extra_data,
-	.get_video_info = av1_video_info,
-};
+static bool ffmpeg_amf_sei_data(void *data, uint8_t **extra_data, size_t *size)
+{
+	struct ffmpeg_amf_encoder *enc = data;
 
-struct obs_encoder_info aom_av1_encoder_info = {
-	.id = "ffmpeg_aom_av1",
+	*extra_data = enc->sei;
+	*size = enc->sei_size;
+	return true;
+}
+
+struct obs_encoder_info ffmpeg_amf_encoder_info = {
+	.id = "obs_ffmpeg_amf",
 	.type = OBS_ENCODER_VIDEO,
-	.codec = "av1",
-	.get_name = aom_av1_getname,
-	.create = aom_av1_create,
-	.destroy = av1_destroy,
-	.encode = av1_encode,
-	.get_defaults = av1_defaults,
-	.get_properties = aom_av1_properties,
-	.get_extra_data = av1_extra_data,
-	.get_video_info = av1_video_info,
+	.codec = "h264",
+	.get_name = ffmpeg_amf_getname,
+	.create = ffmpeg_amf_create,
+	.destroy = ffmpeg_amf_destroy,
+	.encode = ffmpeg_amf_encode,
+	.update = ffmpeg_amf_reconfigure,
+	.get_defaults = amf_defaults,
+	.get_properties = amf_properties,
+	.get_extra_data = ffmpeg_amf_extra_data,
+	.get_sei_data = ffmpeg_amf_sei_data,
+	.get_video_info = ffmpeg_amf_video_info,
+#ifdef _WIN32
+	.caps = OBS_ENCODER_CAP_DYN_BITRATE | OBS_ENCODER_CAP_INTERNAL,
+#else
+	.caps = OBS_ENCODER_CAP_DYN_BITRATE,
+#endif
 };

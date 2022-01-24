@@ -28,7 +28,7 @@ using namespace amf;
 /* ========================================================================= */
 /* Junk                                                                      */
 
-#define do_log(level, format, ...)             \
+#define do_log(level, format, ...)                 \
 	blog(level, "[texture-amf: '%s'] " format, \
 	     obs_encoder_get_name(enc->encoder), ##__VA_ARGS__)
 
@@ -631,13 +631,13 @@ try {
 	return enc;
 
 } catch (const amf_error &err) {
-	blog(LOG_ERROR, "[obs-amf] %s: %s: %s", __FUNCTION__, err.str,
+	blog(LOG_ERROR, "[texture-amf] %s: %s: %s", __FUNCTION__, err.str,
 	     amf_trace->GetResultText(err.res));
-	return obs_encoder_create_rerouted(encoder, "obs_ffmpeg_amf");
+	return obs_encoder_create_rerouted(encoder, "h264_ffmpeg_amf");
 
 } catch (const char *err) {
-	blog(LOG_ERROR, "[obs-amf] %s: %s", __FUNCTION__, err);
-	return obs_encoder_create_rerouted(encoder, "obs_ffmpeg_amf");
+	blog(LOG_ERROR, "[texture-amf] %s: %s", __FUNCTION__, err);
+	return obs_encoder_create_rerouted(encoder, "h264_ffmpeg_amf");
 }
 
 static void amf_video_info(void *, struct video_scale_info *info)
@@ -648,7 +648,7 @@ static void amf_video_info(void *, struct video_scale_info *info)
 static void register_avc()
 {
 	struct obs_encoder_info amf_encoder_info = {};
-	amf_encoder_info.id = "texture_amf";
+	amf_encoder_info.id = "h264_texture_amf";
 	amf_encoder_info.type = OBS_ENCODER_VIDEO;
 	amf_encoder_info.codec = "h264";
 	amf_encoder_info.get_name = amf_avc_get_name;

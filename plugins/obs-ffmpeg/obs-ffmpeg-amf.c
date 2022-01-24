@@ -29,8 +29,8 @@
 
 #include "obs-ffmpeg-formats.h"
 
-#define do_log(level, format, ...)                    \
-	blog(level, "[obs-ffmpeg-amf: '%s'] " format, \
+#define do_log(level, format, ...)                \
+	blog(level, "[ffmpeg-amf: '%s'] " format, \
 	     obs_encoder_get_name(enc->encoder), ##__VA_ARGS__)
 
 #define warn(format, ...) do_log(LOG_WARNING, format, ##__VA_ARGS__)
@@ -49,9 +49,6 @@ struct ffmpeg_amf_encoder {
 
 	uint8_t *header;
 	size_t header_size;
-
-	uint8_t *sei;
-	size_t sei_size;
 
 	int height;
 	bool first_packet;
@@ -279,7 +276,6 @@ static void ffmpeg_amf_destroy(void *data)
 	av_frame_free(&enc->vframe);
 	da_free(enc->buffer);
 	bfree(enc->header);
-	bfree(enc->sei);
 
 	bfree(enc);
 }
@@ -391,7 +387,7 @@ static bool ffmpeg_amf_encode(void *data, struct encoder_frame *frame,
 			obs_extract_avc_headers(av_pkt.data, av_pkt.size,
 						&new_packet, &size,
 						&enc->header, &enc->header_size,
-						&enc->sei, &enc->sei_size);
+						NULL, NULL);
 
 			da_copy_array(enc->buffer, new_packet, size);
 			bfree(new_packet);
@@ -499,17 +495,8 @@ static bool ffmpeg_amf_extra_data(void *data, uint8_t **extra_data,
 	return true;
 }
 
-static bool ffmpeg_amf_sei_data(void *data, uint8_t **extra_data, size_t *size)
-{
-	struct ffmpeg_amf_encoder *enc = data;
-
-	*extra_data = enc->sei;
-	*size = enc->sei_size;
-	return true;
-}
-
 struct obs_encoder_info ffmpeg_amf_encoder_info = {
-	.id = "obs_ffmpeg_amf",
+	.id = "h264_ffmpeg_amf",
 	.type = OBS_ENCODER_VIDEO,
 	.codec = "h264",
 	.get_name = ffmpeg_amf_getname,
@@ -520,7 +507,6 @@ struct obs_encoder_info ffmpeg_amf_encoder_info = {
 	.get_defaults = amf_defaults,
 	.get_properties = amf_properties,
 	.get_extra_data = ffmpeg_amf_extra_data,
-	.get_sei_data = ffmpeg_amf_sei_data,
 	.get_video_info = ffmpeg_amf_video_info,
 #ifdef _WIN32
 	.caps = OBS_ENCODER_CAP_DYN_BITRATE | OBS_ENCODER_CAP_INTERNAL,

@@ -29,7 +29,7 @@ using namespace amf;
 /* Junk                                                                      */
 
 #define do_log(level, format, ...)             \
-	blog(level, "[obs-amf: '%s'] " format, \
+	blog(level, "[texture-amf: '%s'] " format, \
 	     obs_encoder_get_name(enc->encoder), ##__VA_ARGS__)
 
 #define error(format, ...) do_log(LOG_ERROR, format, ##__VA_ARGS__)
@@ -648,7 +648,7 @@ static void amf_video_info(void *, struct video_scale_info *info)
 static void register_avc()
 {
 	struct obs_encoder_info amf_encoder_info = {};
-	amf_encoder_info.id = "ffmpeg_nvenc";
+	amf_encoder_info.id = "texture_amf";
 	amf_encoder_info.type = OBS_ENCODER_VIDEO;
 	amf_encoder_info.codec = "h264";
 	amf_encoder_info.get_name = amf_avc_get_name;

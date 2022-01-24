@@ -112,7 +112,7 @@ template<typename T>
 static void set_amf_property(amf_data *enc, const wchar_t *name, const T &value)
 {
 	AMF_RESULT res = enc->amf_encoder->SetProperty(name, value);
-	if (!res)
+	if (res != AMF_OK)
 		error("Failed to set property '%ls': %ls", name,
 		      amf_trace->GetResultText(res));
 }

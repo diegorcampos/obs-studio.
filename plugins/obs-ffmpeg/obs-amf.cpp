@@ -113,7 +113,7 @@ static void set_amf_property(amf_data *enc, const wchar_t *name, const T &value)
 {
 	AMF_RESULT res = enc->amf_encoder->SetProperty(name, value);
 	if (!res)
-		error("Failed to set property '%ls': %s", name,
+		error("Failed to set property '%ls': %ls", name,
 		      amf_trace->GetResultText(res));
 }
 
@@ -633,11 +633,11 @@ try {
 } catch (const amf_error &err) {
 	blog(LOG_ERROR, "[obs-amf] %s: %s: %s", __FUNCTION__, err.str,
 	     amf_trace->GetResultText(err.res));
-	return nullptr;
+	return obs_encoder_create_rerouted(encoder, "obs_ffmpeg_amf");
 
 } catch (const char *err) {
 	blog(LOG_ERROR, "[obs-amf] %s: %s", __FUNCTION__, err);
-	return nullptr;
+	return obs_encoder_create_rerouted(encoder, "obs_ffmpeg_amf");
 }
 
 static void amf_video_info(void *, struct video_scale_info *info)

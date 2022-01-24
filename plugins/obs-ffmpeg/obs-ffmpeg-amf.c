@@ -29,8 +29,8 @@
 
 #include "obs-ffmpeg-formats.h"
 
-#define do_log(level, format, ...)                        \
-	blog(level, "[FFMpeg AMF encoder: '%s'] " format, \
+#define do_log(level, format, ...)                    \
+	blog(level, "[obs-ffmpeg-amf: '%s'] " format, \
 	     obs_encoder_get_name(enc->encoder), ##__VA_ARGS__)
 
 #define warn(format, ...) do_log(LOG_WARNING, format, ##__VA_ARGS__)

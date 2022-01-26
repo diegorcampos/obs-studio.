@@ -496,9 +496,29 @@ static void amf_destroy(void *data)
 	delete enc;
 }
 
-extern "C" void amf_defaults(obs_data_t *settings);
+static void amf_video_info(void *, struct video_scale_info *info)
+{
+	info->format = VIDEO_FORMAT_NV12;
+}
 
-extern "C" obs_properties_t *amf_properties(void *unused);
+static void check_texture_encode_capability(obs_encoder_t *encoder, bool hevc)
+{
+	obs_video_info ovi;
+	obs_get_video_info(&ovi);
+
+	if (obs_encoder_scaling_enabled(encoder))
+		throw "Encoder scaling is active";
+	if (!obs_nv12_tex_active())
+		throw "NV12 textures aren't active";
+
+	if ((hevc && !caps[ovi.adapter].supports_hevc) ||
+	    (!hevc && !caps[ovi.adapter].supports_avc))
+		throw "Wrong adapter";
+}
+
+extern "C" void amf_defaults(obs_data_t *settings);
+extern "C" obs_properties_t *amf_avc_properties(void *unused);
+extern "C" obs_properties_t *amf_hevc_properties(void *unused);
 
 /* ========================================================================= */
 /* AVC Implementation                                                        */
@@ -513,11 +533,11 @@ static inline int get_avc_preset(obs_data_t *settings)
 	const char *preset = obs_data_get_string(settings, "preset");
 
 	if (astrcmpi(preset, "balanced") == 0)
-		return AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED;
+		return AMF_VIDEO_ENCODER_QUALITY_PRESET_BALANCED;
 	else if (astrcmpi(preset, "speed") == 0)
-		return AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED;
+		return AMF_VIDEO_ENCODER_QUALITY_PRESET_SPEED;
 
-	return AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY;
+	return AMF_VIDEO_ENCODER_QUALITY_PRESET_QUALITY;
 }
 
 static inline int get_avc_rate_control(obs_data_t *settings)
@@ -528,10 +548,6 @@ static inline int get_avc_rate_control(obs_data_t *settings)
 		return AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CONSTANT_QP;
 	else if (astrcmpi(rc, "vbr") == 0)
 		return AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR;
-	else if (astrcmpi(rc, "latency_vbr") == 0)
-		return AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_LATENCY_CONSTRAINED_VBR;
-	else if (astrcmpi(rc, "quality_vbr") == 0)
-		return AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_QUALITY_VBR;
 
 	return AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR;
 }
@@ -590,6 +606,8 @@ try {
 	AMF_RESULT res;
 	AMFVariant p;
 
+	check_texture_encode_capability(encoder, false);
+
 	amf_data *enc = new amf_data;
 	enc->encoder = encoder;
 	enc->codec = amf_codec_type::AVC;
@@ -640,11 +658,6 @@ try {
 	return obs_encoder_create_rerouted(encoder, "h264_ffmpeg_amf");
 }
 
-static void amf_video_info(void *, struct video_scale_info *info)
-{
-	info->format = VIDEO_FORMAT_NV12;
-}
-
 static void register_avc()
 {
 	struct obs_encoder_info amf_encoder_info = {};
@@ -657,7 +670,141 @@ static void register_avc()
 	amf_encoder_info.encode_texture = amf_encode_tex;
 	amf_encoder_info.update = amf_avc_update;
 	amf_encoder_info.get_defaults = amf_defaults;
-	amf_encoder_info.get_properties = amf_properties;
+	amf_encoder_info.get_properties = amf_avc_properties;
+	amf_encoder_info.get_extra_data = amf_extra_data;
+	amf_encoder_info.get_video_info = amf_video_info;
+	amf_encoder_info.caps = OBS_ENCODER_CAP_PASS_TEXTURE;
+
+	obs_register_encoder(&amf_encoder_info);
+}
+
+/* ========================================================================= */
+/* HEVC Implementation                                                       */
+
+static const char *amf_hevc_get_name(void *)
+{
+	return "Shiny AMD AMF HEVC Encoder I guess? Change later";
+}
+
+static inline int get_hevc_preset(obs_data_t *settings)
+{
+	const char *preset = obs_data_get_string(settings, "preset");
+
+	if (astrcmpi(preset, "balanced") == 0)
+		return AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_BALANCED;
+	else if (astrcmpi(preset, "speed") == 0)
+		return AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_SPEED;
+
+	return AMF_VIDEO_ENCODER_HEVC_QUALITY_PRESET_QUALITY;
+}
+
+static inline int get_hevc_rate_control(obs_data_t *settings)
+{
+	const char *rc = obs_data_get_string(settings, "rate_control");
+
+	if (astrcmpi(rc, "cqp") == 0)
+		return AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CONSTANT_QP;
+	else if (astrcmpi(rc, "vbr") == 0)
+		return AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_PEAK_CONSTRAINED_VBR;
+
+	return AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR;
+}
+
+static bool amf_hevc_update(void *data, obs_data_t *settings)
+{
+	amf_data *enc = (amf_data *)data;
+
+	int rc = get_hevc_rate_control(settings);
+
+	set_hevc_property(enc, RATE_CONTROL_METHOD, rc);
+	set_hevc_property(enc, ENABLE_VBAQ, true);
+
+	if (rc != AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CONSTANT_QP) {
+		int64_t bitrate = obs_data_get_int(settings, "bitrate") * 1000;
+		set_hevc_property(enc, TARGET_BITRATE, bitrate);
+		set_hevc_property(enc, PEAK_BITRATE, bitrate * 15 / 10);
+		set_hevc_property(enc, VBV_BUFFER_SIZE, bitrate);
+	} else {
+		int64_t qp = obs_data_get_int(settings, "cqp");
+		set_hevc_property(enc, QP_I, qp);
+		set_hevc_property(enc, QP_P, qp);
+	}
+
+	set_avc_property(enc, ENFORCE_HRD, true);
+	set_hevc_property(enc, HIGH_MOTION_QUALITY_BOOST_ENABLE, false);
+
+	int keyint_sec = (int)obs_data_get_int(settings, "keyint_sec");
+	int gop_size = (keyint_sec) ? keyint_sec * enc->fps_num / enc->fps_den
+				    : 250;
+
+	set_hevc_property(enc, NUM_GOPS_PER_IDR, gop_size);
+	return true;
+}
+
+static void *amf_hevc_create(obs_data_t *settings, obs_encoder_t *encoder)
+try {
+	AMF_RESULT res;
+	AMFVariant p;
+
+	check_texture_encode_capability(encoder, true);
+
+	amf_data *enc = new amf_data;
+	enc->encoder = encoder;
+	enc->codec = amf_codec_type::HEVC;
+
+	if (!amf_init_d3d11(enc))
+		throw "Failed to create D3D11";
+	if (!amf_create_encoder(enc))
+		throw "Failed to create encoder";
+
+	set_hevc_property(enc, FRAMESIZE, AMFConstructSize(enc->cx, enc->cy));
+	set_hevc_property(enc, USAGE, AMF_VIDEO_ENCODER_USAGE_TRANSCONDING);
+	set_hevc_property(enc, QUALITY_PRESET, get_hevc_preset(settings));
+	set_hevc_property(enc, PROFILE, AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN);
+	set_hevc_property(enc, LOWLATENCY_MODE, false);
+
+	res = enc->amf_encoder->Init(AMF_SURFACE_NV12, enc->cx, enc->cy);
+	if (res != AMF_OK)
+		throw amf_error("AMFComponent::Init failed", res);
+
+	set_hevc_property(enc, FRAMERATE, enc->amf_frame_rate);
+
+	res = enc->amf_encoder->GetProperty(AMF_VIDEO_ENCODER_HEVC_EXTRADATA, &p);
+	if (res == AMF_OK && p.type == AMF_VARIANT_INTERFACE)
+		enc->header = AMFBufferPtr(p.pInterface);
+
+	/* XXX: No idea if you can set color range */
+
+	amf_hevc_update(enc, settings);
+
+	/* reduce polling latency (not sure why, what, or where it's polling
+	 * but whatever. why, what, where.. whatever. that's my motto) */
+	set_amf_property(enc, L"TIMEOUT", 50);
+	return enc;
+
+} catch (const amf_error &err) {
+	blog(LOG_ERROR, "[texture-amf] %s: %s: %s", __FUNCTION__, err.str,
+	     amf_trace->GetResultText(err.res));
+	return obs_encoder_create_rerouted(encoder, "h265_ffmpeg_amf");
+
+} catch (const char *err) {
+	blog(LOG_ERROR, "[texture-amf] %s: %s", __FUNCTION__, err);
+	return obs_encoder_create_rerouted(encoder, "h265_ffmpeg_amf");
+}
+
+static void register_hevc()
+{
+	struct obs_encoder_info amf_encoder_info = {};
+	amf_encoder_info.id = "h265_texture_amf";
+	amf_encoder_info.type = OBS_ENCODER_VIDEO;
+	amf_encoder_info.codec = "hevc";
+	amf_encoder_info.get_name = amf_hevc_get_name;
+	amf_encoder_info.create = amf_hevc_create;
+	amf_encoder_info.destroy = amf_destroy;
+	amf_encoder_info.encode_texture = amf_encode_tex;
+	amf_encoder_info.update = amf_hevc_update;
+	amf_encoder_info.get_defaults = amf_defaults;
+	amf_encoder_info.get_properties = amf_hevc_properties;
 	amf_encoder_info.get_extra_data = amf_extra_data;
 	amf_encoder_info.get_video_info = amf_video_info;
 	amf_encoder_info.caps = OBS_ENCODER_CAP_PASS_TEXTURE;
@@ -673,7 +820,12 @@ public:
 	void AMF_CDECL_CALL Write(const wchar_t *scope,
 				  const wchar_t *text) override
 	{
-		blog(LOG_INFO, "[AMF] [%ls] %ls", scope, text);
+#if DEBUG_AMF_STUFF
+		blog(LOG_DEBUG, "[AMF] [%ls] %ls", scope, text);
+#else
+		(void)scope;
+		(void)text;
+#endif
 	}
 
 	void AMF_CDECL_CALL Flush() override {}
@@ -778,6 +930,8 @@ try {
 
 	if (avc_supported)
 		register_avc();
+	if (hevc_supported)
+		register_hevc();
 
 } catch (const std::string &str) {
 	/* doing debug here because string exceptions indicate the user is

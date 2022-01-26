@@ -432,7 +432,7 @@ static bool rate_control_modified(obs_properties_t *ppts, obs_property_t *p,
 	return true;
 }
 
-obs_properties_t *amf_properties(void *unused)
+static obs_properties_t *amf_properties_internal(bool hevc)
 {
 	obs_properties_t *props = obs_properties_create();
 	obs_property_t *p;
@@ -470,19 +470,32 @@ obs_properties_t *amf_properties(void *unused)
 	add_preset("speed");
 #undef add_preset
 
-	p = obs_properties_add_list(props, "profile",
-				    obs_module_text("Profile"),
-				    OBS_COMBO_TYPE_LIST,
-				    OBS_COMBO_FORMAT_STRING);
+	if (!hevc) {
+		p = obs_properties_add_list(props, "profile",
+					    obs_module_text("Profile"),
+					    OBS_COMBO_TYPE_LIST,
+					    OBS_COMBO_FORMAT_STRING);
 
 #define add_profile(val) obs_property_list_add_string(p, val, val)
-	add_profile("high");
-	add_profile("main");
-	add_profile("baseline");
+		add_profile("high");
+		add_profile("main");
+		add_profile("baseline");
 #undef add_profile
+	}
 
-	UNUSED_PARAMETER(unused);
 	return props;
+}
+
+obs_properties_t *amf_avc_properties(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return amf_properties_internal(false);
+}
+
+obs_properties_t *amf_hevc_properties(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return amf_properties_internal(true);
 }
 
 static bool ffmpeg_amf_extra_data(void *data, uint8_t **extra_data,
@@ -505,7 +518,7 @@ struct obs_encoder_info ffmpeg_amf_encoder_info = {
 	.encode = ffmpeg_amf_encode,
 	.update = ffmpeg_amf_reconfigure,
 	.get_defaults = amf_defaults,
-	.get_properties = amf_properties,
+	.get_properties = amf_avc_properties,
 	.get_extra_data = ffmpeg_amf_extra_data,
 	.get_video_info = ffmpeg_amf_video_info,
 #ifdef _WIN32

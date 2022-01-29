@@ -20,7 +20,6 @@
 #include <util/base.h>
 #include <media-io/video-io.h>
 #include <obs-module.h>
-#include <obs-avc.h>
 
 #include <libavutil/opt.h>
 #include <libavutil/pixdesc.h>
@@ -46,25 +45,28 @@ struct ffmpeg_amf_encoder {
 	AVFrame *vframe;
 
 	DARRAY(uint8_t) buffer;
-
-	uint8_t *header;
-	size_t header_size;
+	DARRAY(uint8_t) header;
 
 	int height;
 	bool first_packet;
 	bool initialized;
 };
 
-static const char *ffmpeg_amf_getname(void *unused)
+static const char *ffmpeg_amf_avc_getname(void *unused)
 {
 	UNUSED_PARAMETER(unused);
-	return "FFmpeg AMF fallback for H.264";
+	return "FFmpeg AMF H.264";
+}
+
+static const char *ffmpeg_amf_hevc_getname(void *unused)
+{
+	UNUSED_PARAMETER(unused);
+	return "FFmpeg AMF H.265";
 }
 
 static inline bool valid_format(enum video_format format)
 {
-	return format == VIDEO_FORMAT_I420 || format == VIDEO_FORMAT_NV12 ||
-	       format == VIDEO_FORMAT_I444;
+	return format == VIDEO_FORMAT_I420 || format == VIDEO_FORMAT_NV12;
 }
 
 static void ffmpeg_amf_video_info(void *data, struct video_scale_info *info)
@@ -85,6 +87,8 @@ static void ffmpeg_amf_video_info(void *data, struct video_scale_info *info)
 static bool ffmpeg_amf_init_codec(struct ffmpeg_amf_encoder *enc)
 {
 	int ret;
+
+	enc->context->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 
 	ret = avcodec_open2(enc->context, enc->ffmpeg_amf, NULL);
 	if (ret < 0) {
@@ -275,12 +279,13 @@ static void ffmpeg_amf_destroy(void *data)
 	av_frame_unref(enc->vframe);
 	av_frame_free(&enc->vframe);
 	da_free(enc->buffer);
-	bfree(enc->header);
+	da_free(enc->header);
 
 	bfree(enc);
 }
 
-static void *ffmpeg_amf_create(obs_data_t *settings, obs_encoder_t *encoder)
+static void *ffmpeg_amf_create(obs_data_t *settings, obs_encoder_t *encoder,
+			       bool hevc)
 {
 	struct ffmpeg_amf_encoder *enc;
 
@@ -290,9 +295,8 @@ static void *ffmpeg_amf_create(obs_data_t *settings, obs_encoder_t *encoder)
 
 	enc = bzalloc(sizeof(*enc));
 	enc->encoder = encoder;
-	enc->ffmpeg_amf = avcodec_find_encoder_by_name("h264_amf");
-	if (!enc->ffmpeg_amf)
-		enc->ffmpeg_amf = avcodec_find_encoder_by_name("amf_h264");
+	enc->ffmpeg_amf =
+		avcodec_find_encoder_by_name(hevc ? "hevc_amf" : "h264_amf");
 	enc->first_packet = true;
 
 	blog(LOG_INFO, "---------------------------------");
@@ -318,6 +322,17 @@ static void *ffmpeg_amf_create(obs_data_t *settings, obs_encoder_t *encoder)
 fail:
 	ffmpeg_amf_destroy(enc);
 	return NULL;
+}
+
+static void *ffmpeg_amf_avc_create(obs_data_t *settings, obs_encoder_t *encoder)
+{
+	return ffmpeg_amf_create(settings, encoder, false);
+}
+
+static void *ffmpeg_amf_hevc_create(obs_data_t *settings,
+				    obs_encoder_t *encoder)
+{
+	return ffmpeg_amf_create(settings, encoder, true);
 }
 
 static inline void copy_data(AVFrame *pic, const struct encoder_frame *frame,
@@ -380,27 +395,22 @@ static bool ffmpeg_amf_encode(void *data, struct encoder_frame *frame,
 
 	if (got_packet && av_pkt.size) {
 		if (enc->first_packet) {
-			uint8_t *new_packet;
-			size_t size;
-
+			if (enc->context->extradata_size) {
+				da_copy_array(enc->header,
+					      enc->context->extradata,
+					      enc->context->extradata_size);
+			}
 			enc->first_packet = false;
-			obs_extract_avc_headers(av_pkt.data, av_pkt.size,
-						&new_packet, &size,
-						&enc->header, &enc->header_size,
-						NULL, NULL);
-
-			da_copy_array(enc->buffer, new_packet, size);
-			bfree(new_packet);
-		} else {
-			da_copy_array(enc->buffer, av_pkt.data, av_pkt.size);
 		}
+
+		da_copy_array(enc->buffer, av_pkt.data, av_pkt.size);
 
 		packet->pts = av_pkt.pts;
 		packet->dts = av_pkt.dts;
 		packet->data = enc->buffer.array;
 		packet->size = enc->buffer.num;
 		packet->type = OBS_ENCODER_VIDEO;
-		packet->keyframe = obs_avc_keyframe(packet->data, packet->size);
+		packet->keyframe = !!(av_pkt.flags & AV_PKT_FLAG_KEY);
 		*received_packet = true;
 	} else {
 		*received_packet = false;
@@ -498,27 +508,46 @@ obs_properties_t *amf_hevc_properties(void *unused)
 	return amf_properties_internal(true);
 }
 
-static bool ffmpeg_amf_extra_data(void *data, uint8_t **extra_data,
-				  size_t *size)
+static bool ffmpeg_amf_extra_data(void *data, uint8_t **extra_data, size_t *size)
 {
 	struct ffmpeg_amf_encoder *enc = data;
 
-	*extra_data = enc->header;
-	*size = enc->header_size;
+	*extra_data = enc->header.array;
+	*size = enc->header.num;
 	return true;
 }
 
-struct obs_encoder_info ffmpeg_amf_encoder_info = {
+struct obs_encoder_info ffmpeg_amf_avc_encoder_info = {
 	.id = "h264_ffmpeg_amf",
 	.type = OBS_ENCODER_VIDEO,
 	.codec = "h264",
-	.get_name = ffmpeg_amf_getname,
-	.create = ffmpeg_amf_create,
+	.get_name = ffmpeg_amf_avc_getname,
+	.create = ffmpeg_amf_avc_create,
 	.destroy = ffmpeg_amf_destroy,
 	.encode = ffmpeg_amf_encode,
 	.update = ffmpeg_amf_reconfigure,
 	.get_defaults = amf_defaults,
 	.get_properties = amf_avc_properties,
+	.get_extra_data = ffmpeg_amf_extra_data,
+	.get_video_info = ffmpeg_amf_video_info,
+#ifdef _WIN32
+	.caps = OBS_ENCODER_CAP_DYN_BITRATE | OBS_ENCODER_CAP_INTERNAL,
+#else
+	.caps = OBS_ENCODER_CAP_DYN_BITRATE,
+#endif
+};
+
+struct obs_encoder_info ffmpeg_amf_hevc_encoder_info = {
+	.id = "h265_ffmpeg_amf",
+	.type = OBS_ENCODER_VIDEO,
+	.codec = "hevc",
+	.get_name = ffmpeg_amf_hevc_getname,
+	.create = ffmpeg_amf_hevc_create,
+	.destroy = ffmpeg_amf_destroy,
+	.encode = ffmpeg_amf_encode,
+	.update = ffmpeg_amf_reconfigure,
+	.get_defaults = amf_defaults,
+	.get_properties = amf_hevc_properties,
 	.get_extra_data = ffmpeg_amf_extra_data,
 	.get_video_info = ffmpeg_amf_video_info,
 #ifdef _WIN32
